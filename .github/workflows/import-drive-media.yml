@@ -1,0 +1,150 @@
+name: Import Google Drive media
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/import-drive-media.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: import-vanessa-drive-media
+  cancel-in-progress: false
+
+jobs:
+  import-media:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      DRIVE_FOLDER_URL: https://drive.google.com/drive/folders/16dGWA3s7DInFaQQ1y76Sij8SWNpfEbMI?usp=sharing
+      MEDIA_ROOT: apps/web/public/media/source
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install pinned downloader
+        run: python -m pip install --disable-pip-version-check gdown==6.0.0
+
+      - name: Download shared Google Drive folder
+        run: |
+          set -euo pipefail
+          rm -rf _drive_import
+          mkdir -p _drive_import
+          python -m gdown --folder "$DRIVE_FOLDER_URL" -O _drive_import
+
+      - name: Organize media and generate manifest
+        run: |
+          python <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import mimetypes
+          import shutil
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          source = Path('_drive_import')
+          root = Path('apps/web/public/media/source')
+          images = root / 'images'
+          videos = root / 'videos'
+          other = root / 'other'
+
+          for directory in (images, videos, other):
+              directory.mkdir(parents=True, exist_ok=True)
+
+          def unique_destination(directory: Path, name: str) -> Path:
+              target = directory / name
+              if not target.exists():
+                  return target
+              stem = target.stem
+              suffix = target.suffix
+              index = 2
+              while True:
+                  candidate = directory / f'{stem}-{index}{suffix}'
+                  if not candidate.exists():
+                      return candidate
+                  index += 1
+
+          entries = []
+          for path in sorted(p for p in source.rglob('*') if p.is_file()):
+              mime, _ = mimetypes.guess_type(path.name)
+              mime = mime or 'application/octet-stream'
+              if mime.startswith('image/'):
+                  category = 'image'
+                  destination_dir = images
+              elif mime.startswith('video/'):
+                  category = 'video'
+                  destination_dir = videos
+              else:
+                  category = 'other'
+                  destination_dir = other
+
+              destination = unique_destination(destination_dir, path.name)
+              shutil.copy2(path, destination)
+              digest = hashlib.sha256(destination.read_bytes()).hexdigest()
+              entries.append({
+                  'original_name': path.name,
+                  'repository_path': destination.as_posix(),
+                  'category': category,
+                  'mime_type': mime,
+                  'size_bytes': destination.stat().st_size,
+                  'sha256': digest,
+              })
+
+          if not entries:
+              raise SystemExit('No media files were downloaded from Google Drive.')
+
+          manifest = {
+              'source': 'Google Drive public folder',
+              'source_url': 'https://drive.google.com/drive/folders/16dGWA3s7DInFaQQ1y76Sij8SWNpfEbMI?usp=sharing',
+              'imported_at_utc': datetime.now(timezone.utc).isoformat(),
+              'total_files': len(entries),
+              'images': sum(e['category'] == 'image' for e in entries),
+              'videos': sum(e['category'] == 'video' for e in entries),
+              'other': sum(e['category'] == 'other' for e in entries),
+              'files': entries,
+          }
+
+          (root / 'media-manifest.json').write_text(
+              json.dumps(manifest, ensure_ascii=False, indent=2) + '\n',
+              encoding='utf-8',
+          )
+
+          (root / 'README.md').write_text(
+              '# Vanessa Braz — Source Media\n\n'
+              'Arquivos importados automaticamente da pasta pública do Google Drive fornecida para o projeto.\n\n'
+              '- `images/`: imagens originais importadas.\n'
+              '- `videos/`: vídeos originais importados.\n'
+              '- `other/`: outros formatos, se existirem.\n'
+              '- `media-manifest.json`: inventário com nome, caminho, MIME, tamanho e SHA-256.\n\n'
+              'Os nomes originais são preservados para rastreabilidade. A aplicação pode gerar posteriormente versões WebP/AVIF e nomes semânticos sem destruir os originais.\n',
+              encoding='utf-8',
+          )
+
+          print(f"Imported {manifest['total_files']} files: {manifest['images']} images, {manifest['videos']} videos, {manifest['other']} other.")
+          PY
+
+      - name: Commit imported media
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$MEDIA_ROOT"
+          if git diff --cached --quiet; then
+            echo "No media changes to commit."
+            exit 0
+          fi
+          git commit -m "assets(media): import Vanessa Braz media from Google Drive"
+          git push origin HEAD:main
